@@ -1,1 +1,532 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8" /><title>Countdowns & Posts — One-File Supabase App</title><meta name="viewport" content="width=device-width, initial-scale=1" /><!-- Tailwind (CDN) for quick styling; can be removed if you prefer plain CSS --><script src="https://cdn.tailwindcss.com"></script><!-- Supabase JS v2 --><script src="https://unpkg.com/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script><style> /* minimal extras */ .card { @apply rounded-2xl shadow p-5 bg-white; } .btn { @apply px-4 py-2 rounded-xl shadow font-medium hover:opacity-90 disabled:opacity-50; } .btn-primary { @apply bg-blue-600 text-white; } .btn-outline { @apply border border-gray-300; } .input { @apply w-full px-3 py-2 rounded-lg border border-gray-300 focus:outline-none focus:ring; } .label { @apply text-sm font-medium text-gray-700; } .badge { @apply inline-block text-xs px-2 py-1 rounded-full bg-gray-100 border; } .link { @apply text-blue-600 hover:underline; } .mono { font-variant-ligatures: none; } </style></head><body class="min-h-screen bg-gray-50 text-gray-900"><div id="app" class="max-w-5xl mx-auto p-4 md:p-8 space-y-6"><!-- Filled by JS --></div><script>/* =========================== 0) SUPABASE: CONFIG =========================== */const SUPABASE_URL = "https://fzwcjvygqobzhxcqqbxd.supabase.co"; // <- replaceconst SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ6d2NqdnlncW9iemh4Y3FxYnhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTU4MTU0ODIsImV4cCI6MjA3MTM5MTQ4Mn0.tJVa9CW4U5wW8R7FzTKglanDyzP9-4LeeP7wQAFm1x4"; // <- replaceconst sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);/* =========================== 1) SQL YOU MUST RUN ONCE =========================== *//*-- Run this in Supabase SQL editor-- Enable pgcrypto for gen_random_uuid (if not already)create extension if not exists pgcrypto;-- profilescreate table if not exists public.profiles ( id uuid primary key references auth.users(id) on delete cascade, username text unique not null check (username ~ '^[a-z0-9](?:[a-z0-9-]{1,28}[a-z0-9])?$'), created_at timestamp with time zone default now());alter table public.profiles enable row level security;-- posts (includes "post" and "countdown")create table if not exists public.posts ( id uuid primary key default gen_random_uuid(), user_id uuid not null references auth.users(id) on delete cascade, type text not null check (type in ('post','countdown')), content text, -- display text (title/message) target_date timestamptz, -- for countdowns only created_at timestamptz default now());alter table public.posts enable row level security;-- RLS policies-- profiles: anyone can read to view user pagescreate policy "Profiles are readable by anyone"on public.profiles for selectusing (true);-- profiles: user can insert their own (at signup) if not presentcreate policy "Users can insert their own profile"on public.profiles for insertwith check (auth.uid() = id);-- profiles: user can update only their owncreate policy "Users can update their own profile"on public.profiles for updateusing (auth.uid() = id)with check (auth.uid() = id);-- posts: anyone can read (public pages)create policy "Posts are readable by anyone"on public.posts for selectusing (true);-- posts: owner can insertcreate policy "Users can insert their posts"on public.posts for insertwith check (auth.uid() = user_id);-- posts: owner can updatecreate policy "Users can update their posts"on public.posts for updateusing (auth.uid() = user_id)with check (auth.uid() = user_id);-- posts: owner can deletecreate policy "Users can delete their posts"on public.posts for deleteusing (auth.uid() = user_id);*//* =========================== 2) UTILITIES =========================== */const $ = (sel) => document.querySelector(sel);const app = $("#app");const escapeHTML = (str = "") => str .replaceAll("&", "&amp;") .replaceAll("<", "&lt;") .replaceAll(">", "&gt;");const fmtDateLocal = (iso) => { if (!iso) return ""; const d = new Date(iso); return d.toLocaleString();};function setCookie(name, value, days = 365) { const exp = new Date(); exp.setTime(exp.getTime() + (days*24*60*60*1000)); document.cookie = `${name}=${encodeURIComponent(value)}; expires=${exp.toUTCString()}; path=/; SameSite=Lax`;}function getCookie(name) { return document.cookie.split("; ").reduce((acc, c) => { const [k, ...rest] = c.split("="); acc[k] = decodeURIComponent(rest.join("=")); return acc; }, {})[name];}/* =========================== 3) ROUTING - / => Home/Dashboard (if logged) or Auth - /:username => Public page of that user =========================== */function currentPathSegment() { const seg = window.location.pathname.split("/").filter(Boolean)[0]; return seg || "";}async function route() { const { data: { user } } = await sb.auth.getUser(); const seg = currentPathSegment(); if (seg) { renderUserPublicPage(seg, user); } else { renderHome(user); }}/* =========================== 4) AUTH UI =========================== */function authCard() { return ` <div class="card space-y-4"><h2 class="text-2xl font-bold">Welcome</h2><p class="text-gray-600">Sign up or log in to manage your page, posts and countdowns.</p><div class="grid md:grid-cols-2 gap-4"><div class="space-y-2"><div class="label">Email</div><input id="email" type="email" class="input" placeholder="you@example.com" /></div><div class="space-y-2"><div class="label">Password</div><input id="password" type="password" class="input" placeholder="••••••••" /></div></div><div class="space-y-2"><div class="label">Username (public URL)</div><input id="username" class="input mono" placeholder="your-name" /><div class="text-xs text-gray-500">Your page will be <span class="mono">/your-name</span>. Use 3–30 chars: lowercase letters, digits, hyphens; must start/end with letter or digit.</div></div><div class="flex flex-wrap gap-3"><button class="btn btn-primary" onclick="signup()">Sign up</button><button class="btn btn-outline" onclick="login()">Log in</button></div></div> `;}async function signup() { const email = $("#email").value.trim(); const password = $("#password").value.trim(); const username = ($("#username").value || "").trim().toLowerCase(); if (!email || !password || !username) return alert("Fill email, password, username."); if (!/^[a-z0-9](?:[a-z0-9-]{1,28}[a-z0-9])?$/.test(username)) return alert("Invalid username format."); const { data, error } = await sb.auth.signUp({ email, password }); if (error) return alert(error.message); const uid = data.user?.id; if (uid) { const { error: e2 } = await sb.from("profiles").insert({ id: uid, username }); if (e2) return alert("Profile error: " + e2.message); setCookie("last_username", username); } alert("Signed up! Check your email if confirmation is required. You are now logged in."); await route();}async function login() { const email = $("#email").value.trim(); const password = $("#password").value.trim(); if (!email || !password) return alert("Fill email and password."); const { data, error } = await sb.auth.signInWithPassword({ email, password }); if (error) return alert(error.message); // ensure a profile exists; if not (legacy account), ask for username const uid = data.user?.id; if (uid) { const { data: prof } = await sb.from("profiles").select("username").eq("id", uid).maybeSingle(); if (!prof) { let username = prompt("Choose a username for your public page (lowercase, digits, hyphens):", getCookie("last_username") || ""); if (!username) return alert("Please set your username later in Settings."); username = username.toLowerCase().trim(); if (!/^[a-z0-9](?:[a-z0-9-]{1,28}[a-z0-9])?$/.test(username)) return alert("Invalid username format."); const { error: e2 } = await sb.from("profiles").insert({ id: uid, username }); if (e2) return alert("Profile error: " + e2.message); setCookie("last_username", username); } else { setCookie("last_username", prof.username); } } await route();}async function logout() { await sb.auth.signOut(); await route();}/* =========================== 5) HOME / DASHBOARD =========================== */function renderHome(user) { const last = getCookie("last_username"); app.innerHTML = ` <header class="flex justify-between items-center"><a class="text-xl font-bold" href="/">⏳ Countdown & Posts</a><div> ${user ? ` <span class="mr-3 text-sm text-gray-600">Logged in as <span class="font-semibold">${escapeHTML(user.email)}</span></span><button class="btn btn-outline" onclick="logout()">Logout</button> ` : ``} </div></header> ${!user ? authCard() : ` <div class="grid md:grid-cols-3 gap-6"><div class="md:col-span-2 space-y-6"> ${composerCard()} <div id="my-posts" class="space-y-4"></div></div><div class="space-y-4"> ${myPageCard(last)} ${settingsCard()} </div></div> `} <footer class="text-xs text-gray-400 pt-6">One-file app • Supabase + Vanilla JS</footer> `; if (user) loadMyPosts();}function myPageCard(lastUsername) { const hint = lastUsername ? `/${escapeHTML(lastUsername)}` : "/your-username"; return ` <div class="card"><h3 class="text-lg font-semibold mb-2">Your Public Page</h3><p class="text-sm text-gray-600">Share your link:</p><div class="mono mt-2 p-2 border rounded bg-gray-50">${location.origin}${hint}</div><div class="mt-3"><a class="btn btn-outline" href="${hint}">Open your page</a></div></div> `;}function settingsCard() { return ` <div class="card space-y-3"><h3 class="text-lg font-semibold">Settings</h3><p class="text-sm text-gray-600">Change your public username.</p><div class="space-y-2"><div class="label">New username</div><input id="set-username" class="input mono" placeholder="new-name" /></div><button class="btn btn-outline" onclick="updateUsername()">Update username</button></div> `;}function composerCard() { return ` <div class="card space-y-4"><h3 class="text-lg font-semibold">Create</h3><div class="grid md:grid-cols-2 gap-4"><div class="space-y-2"><div class="label">Post content</div><textarea id="post-content" class="input" rows="3" placeholder="Write something..."></textarea><button class="btn btn-primary mt-1" onclick="createPost()">Publish Post</button></div><div class="space-y-2"><div class="label">Countdown title</div><input id="cd-title" class="input" placeholder="My Big Launch" /><div class="label">Target date/time (local)</div><input id="cd-when" type="datetime-local" class="input" /><button class="btn btn-primary mt-1" onclick="createCountdown()">Publish Countdown</button></div></div></div> `;}async function updateUsername() { const { data: { user } } = await sb.auth.getUser(); if (!user) return alert("Not logged in."); const val = $("#set-username").value.trim().toLowerCase(); if (!/^[a-z0-9](?:[a-z0-9-]{1,28}[a-z0-9])?$/.test(val)) return alert("Invalid username format."); const { error } = await sb.from("profiles").update({ username: val }).eq("id", user.id); if (error) return alert(error.message); setCookie("last_username", val); alert("Username updated!"); await route();}async function loadMyPosts() { const { data: { user } } = await sb.auth.getUser(); if (!user) return; const { data: posts, error } = await sb .from("posts") .select("*") .eq("user_id", user.id) .order("created_at", { ascending: false }); if (error) return ($("#my-posts").innerHTML = `<div class="card">Error: ${escapeHTML(error.message)}</div>`); const list = posts.map(renderPostRow).join(""); $("#my-posts").innerHTML = ` <div class="card"><h3 class="text-lg font-semibold mb-3">Your items</h3><div class="space-y-3">${list || `<div class="text-sm text-gray-500">No items yet.</div>`}</div></div> `; // activate timers posts.forEach(p => { if (p.type === "countdown") bootCountdownTimer(p.id, p.target_date); });}function renderPostRow(p) { const isCountdown = p.type === "countdown"; return ` <div class="border rounded-xl p-3"><div class="flex justify-between items-center"><div class="space-x-2"><span class="badge">${isCountdown ? "COUNTDOWN" : "POST"}</span><span class="text-xs text-gray-500">${fmtDateLocal(p.created_at)}</span></div><div class="space-x-2"><button class="btn btn-outline" onclick="deleteItem('${p.id}')">Delete</button></div></div><div class="mt-2"> ${isCountdown ? `<div class="font-semibold">${escapeHTML(p.content || "")}</div><div class="text-sm text-gray-600">Target: ${fmtDateLocal(p.target_date)}</div><div id="cd-${p.id}" class="text-xl font-mono mt-1"></div>` : `<div>${escapeHTML(p.content || "")}</div>`} </div></div> `;}async function deleteItem(id) { if (!confirm("Delete this item?")) return; const { error } = await sb.from("posts").delete().eq("id", id); if (error) return alert(error.message); await route();}/* =========================== 6) PUBLIC USER PAGE =========================== */async function renderUserPublicPage(username, currentUser) { // get profile by username const { data: profile, error } = await sb.from("profiles").select("id, username").eq("username", username.toLowerCase()).maybeSingle(); if (error || !profile) { app.innerHTML = ` <header class="flex justify-between items-center"><a class="text-xl font-bold" href="/">⏳ Countdown & Posts</a> ${currentUser ? `<button class="btn btn-outline" onclick="logout()">Logout</button>` : `<a class="btn btn-outline" href="/">Home</a>`} </header><div class="card">User "<span class="mono">${escapeHTML(username)}</span>" not found.</div>`; return; } const owner = currentUser && (currentUser.id === profile.id); const { data: posts } = await sb .from("posts") .select("*") .eq("user_id", profile.id) .order("created_at", { ascending: false }); app.innerHTML = ` <header class="flex justify-between items-center"><a class="text-xl font-bold" href="/">⏳ Countdown & Posts</a><div> ${owner ? ` <span class="mr-3 text-sm text-gray-600">You are viewing your public page</span><button class="btn btn-outline" onclick="logout()">Logout</button> ` : ` ${currentUser ? `<button class="btn btn-outline" onclick="logout()">Logout</button>` : `<a class="btn btn-outline" href="/">Sign in</a>`} `} </div></header><div class="card"><h1 class="text-2xl font-bold">@${escapeHTML(profile.username)}</h1><p class="text-gray-600 text-sm">Public posts and countdowns</p></div><div class="space-y-4"> ${(posts || []).map(p => renderPublicItem(p)).join("") || ` <div class="card text-gray-500">Nothing published yet.</div> `} </div> `; (posts || []).forEach(p => { if (p.type === "countdown") bootCountdownTimer(p.id, p.target_date); });}function renderPublicItem(p) { if (p.type === "post") { return ` <div class="card"><div class="flex items-center justify-between"><span class="badge">POST</span><span class="text-xs text-gray-500">${fmtDateLocal(p.created_at)}</span></div><div class="mt-2">${escapeHTML(p.content || "")}</div></div> `; } // countdown return ` <div class="card"><div class="flex items-center justify-between"><span class="badge">COUNTDOWN</span><span class="text-xs text-gray-500">${fmtDateLocal(p.created_at)}</span></div><div class="mt-2 font-semibold">${escapeHTML(p.content || "")}</div><div class="text-sm text-gray-600">Target: ${fmtDateLocal(p.target_date)}</div><div id="cd-${p.id}" class="text-2xl font-mono mt-2"></div></div> `;}/* =========================== 7) CREATE ITEMS =========================== */async function createPost() { const { data: { user } } = await sb.auth.getUser(); if (!user) return alert("Not logged in."); const content = $("#post-content").value.trim(); if (!content) return alert("Write something first."); const { error } = await sb.from("posts").insert({ user_id: user.id, type: "post", content }); if (error) return alert(error.message); $("#post-content").value = ""; await route();}async function createCountdown() { const { data: { user } } = await sb.auth.getUser(); if (!user) return alert("Not logged in."); const title = $("#cd-title").value.trim(); const whenLocal = $("#cd-when").value; // "YYYY-MM-DDTHH:MM" if (!title || !whenLocal) return alert("Fill title and date/time."); const iso = new Date(whenLocal).toISOString(); const { error } = await sb.from("posts").insert({ user_id: user.id, type: "countdown", content: title, target_date: iso, }); if (error) return alert(error.message); $("#cd-title").value = ""; $("#cd-when").value = ""; await route();}/* =========================== 8) COUNTDOWN TIMERS =========================== */const timers = new Map(); // id -> intervalfunction bootCountdownTimer(id, iso) { const el = document.getElementById(`cd-${id}`); if (!el || !iso) return; if (timers.has(id)) clearInterval(timers.get(id)); function tick() { const now = Date.now(); const target = new Date(iso).getTime(); let diff = target - now; if (isNaN(target)) { el.textContent = "Invalid date"; return; } if (diff <= 0) { el.textContent = "Finished 🎉"; clearInterval(timers.get(id)); return; } const d = Math.floor(diff / 86400000); diff %= 86400000; const h = Math.floor(diff / 3600000); diff %= 3600000; const m = Math.floor(diff / 60000); diff %= 60000; const s = Math.floor(diff / 1000); el.textContent = `${d}d ${String(h).padStart(2,"0")}h ${String(m).padStart(2,"0")}m ${String(s).padStart(2,"0")}s`; } tick(); const int = setInterval(tick, 1000); timers.set(id, int);}/* =========================== 9) AUTH STATE WATCH =========================== */sb.auth.onAuthStateChange((_event, _session) => { // Supabase persists session in localStorage automatically. // We simply re-render when auth state changes. route();});/* =========================== 10) START =========================== */route(); </script></body></html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Countdowns & Posts — One-File Supabase App</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Tailwind (CDN) for quick styling; can be removed if you prefer plain CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Supabase JS v2 -->
+  <script src="https://unpkg.com/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+  <style>
+    /* minimal extras */
+    .card { @apply rounded-2xl shadow p-5 bg-white; }
+    .btn  { @apply px-4 py-2 rounded-xl shadow font-medium hover:opacity-90 disabled:opacity-50; }
+    .btn-primary { @apply bg-blue-600 text-white; }
+    .btn-outline { @apply border border-gray-300; }
+    .input { @apply w-full px-3 py-2 rounded-lg border border-gray-300 focus:outline-none focus:ring; }
+    .label { @apply text-sm font-medium text-gray-700; }
+    .badge { @apply inline-block text-xs px-2 py-1 rounded-full bg-gray-100 border; }
+    .link  { @apply text-blue-600 hover:underline; }
+    .mono  { font-variant-ligatures: none; }
+  </style>
+</head>
+<body class="min-h-screen bg-gray-50 text-gray-900">
+  <div id="app" class="max-w-5xl mx-auto p-4 md:p-8 space-y-6">
+    <!-- Filled by JS -->
+  </div>
+
+  <script>
+/* ===========================
+   0) SUPABASE: CONFIG
+   =========================== */
+const SUPABASE_URL = "https://fzwcjvygqobzhxcqqbxd.supabase.co";         // <- replace
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZ6d2NqdnlncW9iemh4Y3FxYnhkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTU4MTU0ODIsImV4cCI6MjA3MTM5MTQ4Mn0.tJVa9CW4U5wW8R7FzTKglanDyzP9-4LeeP7wQAFm1x4";                // <- replace
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+/* ===========================
+   1) SQL YOU MUST RUN ONCE
+   =========================== */
+/*
+-- Run this in Supabase SQL editor
+
+-- Enable pgcrypto for gen_random_uuid (if not already)
+create extension if not exists pgcrypto;
+
+-- profiles
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  username text unique not null check (username ~ '^[a-z0-9](?:[a-z0-9-]{1,28}[a-z0-9])?$'),
+  created_at timestamp with time zone default now()
+);
+alter table public.profiles enable row level security;
+
+-- posts (includes "post" and "countdown")
+create table if not exists public.posts (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  type text not null check (type in ('post','countdown')),
+  content text,                    -- display text (title/message)
+  target_date timestamptz,         -- for countdowns only
+  created_at timestamptz default now()
+);
+alter table public.posts enable row level security;
+
+-- RLS policies
+-- profiles: anyone can read to view user pages
+create policy "Profiles are readable by anyone"
+on public.profiles for select
+using (true);
+
+-- profiles: user can insert their own (at signup) if not present
+create policy "Users can insert their own profile"
+on public.profiles for insert
+with check (auth.uid() = id);
+
+-- profiles: user can update only their own
+create policy "Users can update their own profile"
+on public.profiles for update
+using (auth.uid() = id)
+with check (auth.uid() = id);
+
+-- posts: anyone can read (public pages)
+create policy "Posts are readable by anyone"
+on public.posts for select
+using (true);
+
+-- posts: owner can insert
+create policy "Users can insert their posts"
+on public.posts for insert
+with check (auth.uid() = user_id);
+
+-- posts: owner can update
+create policy "Users can update their posts"
+on public.posts for update
+using (auth.uid() = user_id)
+with check (auth.uid() = user_id);
+
+-- posts: owner can delete
+create policy "Users can delete their posts"
+on public.posts for delete
+using (auth.uid() = user_id);
+*/
+
+/* ===========================
+   2) UTILITIES
+   =========================== */
+const $ = (sel) => document.querySelector(sel);
+const app = $("#app");
+
+const escapeHTML = (str = "") => str
+  .replaceAll("&", "&amp;")
+  .replaceAll("<", "&lt;")
+  .replaceAll(">", "&gt;");
+
+const fmtDateLocal = (iso) => {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return d.toLocaleString();
+};
+
+function setCookie(name, value, days = 365) {
+  const exp = new Date();
+  exp.setTime(exp.getTime() + (days*24*60*60*1000));
+  document.cookie = `${name}=${encodeURIComponent(value)}; expires=${exp.toUTCString()}; path=/; SameSite=Lax`;
+}
+function getCookie(name) {
+  return document.cookie.split("; ").reduce((acc, c) => {
+    const [k, ...rest] = c.split("=");
+    acc[k] = decodeURIComponent(rest.join("="));
+    return acc;
+  }, {})[name];
+}
+
+/* ===========================
+   3) ROUTING
+   - /            => Home/Dashboard (if logged) or Auth
+   - /:username   => Public page of that user
+   =========================== */
+function currentPathSegment() {
+  const seg = window.location.pathname.split("/").filter(Boolean)[0];
+  return seg || "";
+}
+async function route() {
+  const { data: { user } } = await sb.auth.getUser();
+  const seg = currentPathSegment();
+  if (seg) {
+    renderUserPublicPage(seg, user);
+  } else {
+    renderHome(user);
+  }
+}
+
+/* ===========================
+   4) AUTH UI
+   =========================== */
+function authCard() {
+  return `
+    <div class="card space-y-4">
+      <h2 class="text-2xl font-bold">Welcome</h2>
+      <p class="text-gray-600">Sign up or log in to manage your page, posts and countdowns.</p>
+
+      <div class="grid md:grid-cols-2 gap-4">
+        <div class="space-y-2">
+          <div class="label">Email</div>
+          <input id="email" type="email" class="input" placeholder="you@example.com" />
+        </div>
+        <div class="space-y-2">
+          <div class="label">Password</div>
+          <input id="password" type="password" class="input" placeholder="••••••••" />
+        </div>
+      </div>
+
+      <div class="space-y-2">
+        <div class="label">Username (public URL)</div>
+        <input id="username" class="input mono" placeholder="your-name" />
+        <div class="text-xs text-gray-500">Your page will be <span class="mono">/your-name</span>.
+          Use 3–30 chars: lowercase letters, digits, hyphens; must start/end with letter or digit.</div>
+      </div>
+
+      <div class="flex flex-wrap gap-3">
+        <button class="btn btn-primary" onclick="signup()">Sign up</button>
+        <button class="btn btn-outline" onclick="login()">Log in</button>
+      </div>
+    </div>
+  `;
+}
+async function signup() {
+  const email = $("#email").value.trim();
+  const password = $("#password").value.trim();
+  const username = ($("#username").value || "").trim().toLowerCase();
+  if (!email || !password || !username) return alert("Fill email, password, username.");
+
+  if (!/^[a-z0-9](?:[a-z0-9-]{1,28}[a-z0-9])?$/.test(username))
+    return alert("Invalid username format.");
+
+  const { data, error } = await sb.auth.signUp({ email, password });
+  if (error) return alert(error.message);
+
+  const uid = data.user?.id;
+  if (uid) {
+    const { error: e2 } = await sb.from("profiles").insert({ id: uid, username });
+    if (e2) return alert("Profile error: " + e2.message);
+    setCookie("last_username", username);
+  }
+  alert("Signed up! Check your email if confirmation is required. You are now logged in.");
+  await route();
+}
+async function login() {
+  const email = $("#email").value.trim();
+  const password = $("#password").value.trim();
+  if (!email || !password) return alert("Fill email and password.");
+  const { data, error } = await sb.auth.signInWithPassword({ email, password });
+  if (error) return alert(error.message);
+
+  // ensure a profile exists; if not (legacy account), ask for username
+  const uid = data.user?.id;
+  if (uid) {
+    const { data: prof } = await sb.from("profiles").select("username").eq("id", uid).maybeSingle();
+    if (!prof) {
+      let username = prompt("Choose a username for your public page (lowercase, digits, hyphens):", getCookie("last_username") || "");
+      if (!username) return alert("Please set your username later in Settings.");
+      username = username.toLowerCase().trim();
+      if (!/^[a-z0-9](?:[a-z0-9-]{1,28}[a-z0-9])?$/.test(username))
+        return alert("Invalid username format.");
+      const { error: e2 } = await sb.from("profiles").insert({ id: uid, username });
+      if (e2) return alert("Profile error: " + e2.message);
+      setCookie("last_username", username);
+    } else {
+      setCookie("last_username", prof.username);
+    }
+  }
+  await route();
+}
+async function logout() {
+  await sb.auth.signOut();
+  await route();
+}
+
+/* ===========================
+   5) HOME / DASHBOARD
+   =========================== */
+function renderHome(user) {
+  const last = getCookie("last_username");
+  app.innerHTML = `
+    <header class="flex justify-between items-center">
+      <a class="text-xl font-bold" href="/">⏳ Countdown & Posts</a>
+      <div>
+        ${user ? `
+          <span class="mr-3 text-sm text-gray-600">Logged in as <span class="font-semibold">${escapeHTML(user.email)}</span></span>
+          <button class="btn btn-outline" onclick="logout()">Logout</button>
+        ` : ``}
+      </div>
+    </header>
+
+    ${!user ? authCard() : `
+      <div class="grid md:grid-cols-3 gap-6">
+        <div class="md:col-span-2 space-y-6">
+          ${composerCard()}
+          <div id="my-posts" class="space-y-4"></div>
+        </div>
+        <div class="space-y-4">
+          ${myPageCard(last)}
+          ${settingsCard()}
+        </div>
+      </div>
+    `}
+    <footer class="text-xs text-gray-400 pt-6">One-file app • Supabase + Vanilla JS</footer>
+  `;
+  if (user) loadMyPosts();
+}
+function myPageCard(lastUsername) {
+  const hint = lastUsername ? `/${escapeHTML(lastUsername)}` : "/your-username";
+  return `
+    <div class="card">
+      <h3 class="text-lg font-semibold mb-2">Your Public Page</h3>
+      <p class="text-sm text-gray-600">Share your link:</p>
+      <div class="mono mt-2 p-2 border rounded bg-gray-50">${location.origin}${hint}</div>
+      <div class="mt-3">
+        <a class="btn btn-outline" href="${hint}">Open your page</a>
+      </div>
+    </div>
+  `;
+}
+function settingsCard() {
+  return `
+    <div class="card space-y-3">
+      <h3 class="text-lg font-semibold">Settings</h3>
+      <p class="text-sm text-gray-600">Change your public username.</p>
+      <div class="space-y-2">
+        <div class="label">New username</div>
+        <input id="set-username" class="input mono" placeholder="new-name" />
+      </div>
+      <button class="btn btn-outline" onclick="updateUsername()">Update username</button>
+    </div>
+  `;
+}
+function composerCard() {
+  return `
+    <div class="card space-y-4">
+      <h3 class="text-lg font-semibold">Create</h3>
+      <div class="grid md:grid-cols-2 gap-4">
+        <div class="space-y-2">
+          <div class="label">Post content</div>
+          <textarea id="post-content" class="input" rows="3" placeholder="Write something..."></textarea>
+          <button class="btn btn-primary mt-1" onclick="createPost()">Publish Post</button>
+        </div>
+        <div class="space-y-2">
+          <div class="label">Countdown title</div>
+          <input id="cd-title" class="input" placeholder="My Big Launch" />
+          <div class="label">Target date/time (local)</div>
+          <input id="cd-when" type="datetime-local" class="input" />
+          <button class="btn btn-primary mt-1" onclick="createCountdown()">Publish Countdown</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+async function updateUsername() {
+  const { data: { user } } = await sb.auth.getUser();
+  if (!user) return alert("Not logged in.");
+  const val = $("#set-username").value.trim().toLowerCase();
+  if (!/^[a-z0-9](?:[a-z0-9-]{1,28}[a-z0-9])?$/.test(val))
+    return alert("Invalid username format.");
+  const { error } = await sb.from("profiles").update({ username: val }).eq("id", user.id);
+  if (error) return alert(error.message);
+  setCookie("last_username", val);
+  alert("Username updated!");
+  await route();
+}
+async function loadMyPosts() {
+  const { data: { user } } = await sb.auth.getUser();
+  if (!user) return;
+
+  const { data: posts, error } = await sb
+    .from("posts")
+    .select("*")
+    .eq("user_id", user.id)
+    .order("created_at", { ascending: false });
+
+  if (error) return ($("#my-posts").innerHTML = `<div class="card">Error: ${escapeHTML(error.message)}</div>`);
+
+  const list = posts.map(renderPostRow).join("");
+  $("#my-posts").innerHTML = `
+    <div class="card">
+      <h3 class="text-lg font-semibold mb-3">Your items</h3>
+      <div class="space-y-3">${list || `<div class="text-sm text-gray-500">No items yet.</div>`}</div>
+    </div>
+  `;
+  // activate timers
+  posts.forEach(p => { if (p.type === "countdown") bootCountdownTimer(p.id, p.target_date); });
+}
+function renderPostRow(p) {
+  const isCountdown = p.type === "countdown";
+  return `
+    <div class="border rounded-xl p-3">
+      <div class="flex justify-between items-center">
+        <div class="space-x-2">
+          <span class="badge">${isCountdown ? "COUNTDOWN" : "POST"}</span>
+          <span class="text-xs text-gray-500">${fmtDateLocal(p.created_at)}</span>
+        </div>
+        <div class="space-x-2">
+          <button class="btn btn-outline" onclick="deleteItem('${p.id}')">Delete</button>
+        </div>
+      </div>
+      <div class="mt-2">
+        ${isCountdown
+          ? `<div class="font-semibold">${escapeHTML(p.content || "")}</div>
+             <div class="text-sm text-gray-600">Target: ${fmtDateLocal(p.target_date)}</div>
+             <div id="cd-${p.id}" class="text-xl font-mono mt-1"></div>`
+          : `<div>${escapeHTML(p.content || "")}</div>`}
+      </div>
+    </div>
+  `;
+}
+async function deleteItem(id) {
+  if (!confirm("Delete this item?")) return;
+  const { error } = await sb.from("posts").delete().eq("id", id);
+  if (error) return alert(error.message);
+  await route();
+}
+
+/* ===========================
+   6) PUBLIC USER PAGE
+   =========================== */
+async function renderUserPublicPage(username, currentUser) {
+  // get profile by username
+  const { data: profile, error } = await sb.from("profiles").select("id, username").eq("username", username.toLowerCase()).maybeSingle();
+  if (error || !profile) {
+    app.innerHTML = `
+      <header class="flex justify-between items-center">
+        <a class="text-xl font-bold" href="/">⏳ Countdown & Posts</a>
+        ${currentUser ? `<button class="btn btn-outline" onclick="logout()">Logout</button>` : `<a class="btn btn-outline" href="/">Home</a>`}
+      </header>
+      <div class="card">User "<span class="mono">${escapeHTML(username)}</span>" not found.</div>`;
+    return;
+  }
+
+  const owner = currentUser && (currentUser.id === profile.id);
+
+  const { data: posts } = await sb
+    .from("posts")
+    .select("*")
+    .eq("user_id", profile.id)
+    .order("created_at", { ascending: false });
+
+  app.innerHTML = `
+    <header class="flex justify-between items-center">
+      <a class="text-xl font-bold" href="/">⏳ Countdown & Posts</a>
+      <div>
+        ${owner ? `
+          <span class="mr-3 text-sm text-gray-600">You are viewing your public page</span>
+          <button class="btn btn-outline" onclick="logout()">Logout</button>
+        ` : `
+          ${currentUser ? `<button class="btn btn-outline" onclick="logout()">Logout</button>` : `<a class="btn btn-outline" href="/">Sign in</a>`}
+        `}
+      </div>
+    </header>
+
+    <div class="card">
+      <h1 class="text-2xl font-bold">@${escapeHTML(profile.username)}</h1>
+      <p class="text-gray-600 text-sm">Public posts and countdowns</p>
+    </div>
+
+    <div class="space-y-4">
+      ${(posts || []).map(p => renderPublicItem(p)).join("") || `
+        <div class="card text-gray-500">Nothing published yet.</div>
+      `}
+    </div>
+  `;
+
+  (posts || []).forEach(p => { if (p.type === "countdown") bootCountdownTimer(p.id, p.target_date); });
+}
+function renderPublicItem(p) {
+  if (p.type === "post") {
+    return `
+      <div class="card">
+        <div class="flex items-center justify-between">
+          <span class="badge">POST</span>
+          <span class="text-xs text-gray-500">${fmtDateLocal(p.created_at)}</span>
+        </div>
+        <div class="mt-2">${escapeHTML(p.content || "")}</div>
+      </div>
+    `;
+  }
+  // countdown
+  return `
+    <div class="card">
+      <div class="flex items-center justify-between">
+        <span class="badge">COUNTDOWN</span>
+        <span class="text-xs text-gray-500">${fmtDateLocal(p.created_at)}</span>
+      </div>
+      <div class="mt-2 font-semibold">${escapeHTML(p.content || "")}</div>
+      <div class="text-sm text-gray-600">Target: ${fmtDateLocal(p.target_date)}</div>
+      <div id="cd-${p.id}" class="text-2xl font-mono mt-2"></div>
+    </div>
+  `;
+}
+
+/* ===========================
+   7) CREATE ITEMS
+   =========================== */
+async function createPost() {
+  const { data: { user } } = await sb.auth.getUser();
+  if (!user) return alert("Not logged in.");
+  const content = $("#post-content").value.trim();
+  if (!content) return alert("Write something first.");
+  const { error } = await sb.from("posts").insert({ user_id: user.id, type: "post", content });
+  if (error) return alert(error.message);
+  $("#post-content").value = "";
+  await route();
+}
+async function createCountdown() {
+  const { data: { user } } = await sb.auth.getUser();
+  if (!user) return alert("Not logged in.");
+  const title = $("#cd-title").value.trim();
+  const whenLocal = $("#cd-when").value; // "YYYY-MM-DDTHH:MM"
+  if (!title || !whenLocal) return alert("Fill title and date/time.");
+  const iso = new Date(whenLocal).toISOString();
+  const { error } = await sb.from("posts").insert({
+    user_id: user.id,
+    type: "countdown",
+    content: title,
+    target_date: iso,
+  });
+  if (error) return alert(error.message);
+  $("#cd-title").value = "";
+  $("#cd-when").value = "";
+  await route();
+}
+
+/* ===========================
+   8) COUNTDOWN TIMERS
+   =========================== */
+const timers = new Map(); // id -> interval
+function bootCountdownTimer(id, iso) {
+  const el = document.getElementById(`cd-${id}`);
+  if (!el || !iso) return;
+  if (timers.has(id)) clearInterval(timers.get(id));
+  function tick() {
+    const now = Date.now();
+    const target = new Date(iso).getTime();
+    let diff = target - now;
+    if (isNaN(target)) { el.textContent = "Invalid date"; return; }
+    if (diff <= 0) { el.textContent = "Finished 🎉"; clearInterval(timers.get(id)); return; }
+    const d = Math.floor(diff / 86400000); diff %= 86400000;
+    const h = Math.floor(diff / 3600000); diff %= 3600000;
+    const m = Math.floor(diff / 60000); diff %= 60000;
+    const s = Math.floor(diff / 1000);
+    el.textContent = `${d}d ${String(h).padStart(2,"0")}h ${String(m).padStart(2,"0")}m ${String(s).padStart(2,"0")}s`;
+  }
+  tick();
+  const int = setInterval(tick, 1000);
+  timers.set(id, int);
+}
+
+/* ===========================
+   9) AUTH STATE WATCH
+   =========================== */
+sb.auth.onAuthStateChange((_event, _session) => {
+  // Supabase persists session in localStorage automatically.
+  // We simply re-render when auth state changes.
+  route();
+});
+
+/* ===========================
+   10) START
+   =========================== */
+route();
+
+  </script>
+</body>
+</html>
